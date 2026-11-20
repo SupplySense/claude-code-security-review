@@ -216,6 +216,53 @@ class TestSimpleClaudeRunner:
         assert mock_run.call_count == 2  # Retried once
     
     @patch('subprocess.run')
+    def test_run_security_audit_prompt_too_long_nonzero_exit(self, mock_run):
+        """A non-zero exit carrying 'Prompt is too long' asks for a retry without the diff."""
+        mock_run.return_value = Mock(
+            returncode=1,
+            stdout=json.dumps({'type': 'result', 'is_error': True, 'result': 'Prompt is too long'}),
+            stderr=''
+        )
+        runner = SimpleClaudeRunner()
+        with patch('pathlib.Path.exists', return_value=True):
+            success, error, results = runner.run_security_audit(Path('/tmp/test'), "test prompt")
+
+        assert success is False
+        assert error == "PROMPT_TOO_LONG"
+        assert mock_run.call_count == 1  # No pointless retries with the same prompt
+
+    @patch('subprocess.run')
+    def test_run_security_audit_oversized_prompt_never_reached_model(self, mock_run):
+        """An over-1MB prompt that fails with zero tokens used is treated as too long."""
+        mock_run.return_value = Mock(
+            returncode=1,
+            stdout=json.dumps({'stop_reason': 'stop_sequence', 'usage': {'input_tokens': 0, 'output_tokens': 0}}),
+            stderr=''
+        )
+        runner = SimpleClaudeRunner()
+        with patch('pathlib.Path.exists', return_value=True):
+            success, error, results = runner.run_security_audit(Path('/tmp/test'), 'x' * (1024 * 1024 + 1))
+
+        assert success is False
+        assert error == "PROMPT_TOO_LONG"
+
+    @patch('subprocess.run')
+    def test_run_security_audit_small_prompt_failure_is_not_too_long(self, mock_run):
+        """A small prompt failing with zero tokens (e.g. a rejected key) stays a hard failure."""
+        mock_run.return_value = Mock(
+            returncode=1,
+            stdout=json.dumps({'result': 'Invalid API key', 'usage': {'input_tokens': 0, 'output_tokens': 0}}),
+            stderr=''
+        )
+        runner = SimpleClaudeRunner()
+        with patch('pathlib.Path.exists', return_value=True), patch('time.sleep'):
+            success, error, results = runner.run_security_audit(Path('/tmp/test'), "test prompt")
+
+        assert success is False
+        assert error != "PROMPT_TOO_LONG"
+        assert 'Invalid API key' in error
+
+    @patch('subprocess.run')
     def test_run_security_audit_retry_on_error_during_execution(self, mock_run):
         """Test retry on error_during_execution result."""
         error_result = {

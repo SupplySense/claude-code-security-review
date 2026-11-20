@@ -200,6 +200,37 @@ class SimpleClaudeRunner:
         else:
             self.timeout_seconds = SUBPROCESS_TIMEOUT
     
+    @staticmethod
+    def _result_text(stdout: str) -> str:
+        """Return the 'result' message from Claude Code's JSON output, or ''."""
+        try:
+            parsed = json.loads(stdout)
+        except (ValueError, TypeError):
+            return ''
+        if isinstance(parsed, dict) and isinstance(parsed.get('result'), str):
+            return parsed['result']
+        return ''
+
+    @classmethod
+    def _is_prompt_too_long(cls, stdout: str, prompt_size: int) -> bool:
+        """True when a failed run was rejected because the prompt was too long.
+
+        Matches the CLI's message when present. As a fallback, a prompt over
+        1MB that failed without any tokens being sent to the model is treated
+        the same way: it never reached the API, and retrying without the diff
+        is the only way such a review can run.
+        """
+        if 'prompt is too long' in cls._result_text(stdout).lower():
+            return True
+        if prompt_size <= 1024 * 1024:
+            return False
+        try:
+            parsed = json.loads(stdout)
+        except (ValueError, TypeError):
+            return False
+        usage = parsed.get('usage') if isinstance(parsed, dict) else None
+        return isinstance(usage, dict) and usage.get('input_tokens') == 0 and usage.get('output_tokens') == 0
+
     def run_security_audit(self, repo_dir: Path, prompt: str) -> Tuple[bool, str, Dict[str, Any]]:
         """Run Claude Code security audit.
         
@@ -241,10 +272,17 @@ class SimpleClaudeRunner:
                 )
                 
                 if result.returncode != 0:
+                    # Current Claude Code CLIs exit non-zero when the prompt is
+                    # too long, so the check further down (which only runs on
+                    # exit 0) never sees it. Detect it here so the caller can
+                    # retry without the diff instead of failing the review.
+                    if self._is_prompt_too_long(result.stdout, prompt_size):
+                        return False, "PROMPT_TOO_LONG", {}
                     if attempt == NUM_RETRIES - 1:
                         error_details = f"Claude Code execution failed with return code {result.returncode}\n"
                         error_details += f"Stderr: {result.stderr}\n"
                         error_details += f"Stdout: {result.stdout[:500]}..."  # First 500 chars
+                        error_details += f"\nResult: {self._result_text(result.stdout)[:500]}"
                         return False, error_details, {}
                     else:
                         time.sleep(5*attempt)
